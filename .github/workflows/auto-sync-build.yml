@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 12 * * *'  # daily at noon UTC; releases are infrequent, 6h was excessive
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build & publish a release even if no new upstream version'
+        type: boolean
+        default: false
 
 jobs:
   check:
@@ -29,12 +34,17 @@ jobs:
       # On first run the variable is empty, so any upstream release will trigger a build.
       - name: Compare against last built version
         id: compare
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          LAST: ${{ vars.LAST_BUILT_VERSION }}
+          FORCE: ${{ inputs.force }}
         run: |
-          TAG="${{ steps.upstream.outputs.tag }}"
-          LAST="${{ vars.LAST_BUILT_VERSION }}"
           echo "version=$TAG" >> $GITHUB_OUTPUT
-          echo "Last built: ${LAST:-<none>} | Upstream: $TAG"
-          if [ "$TAG" = "$LAST" ]; then
+          echo "Last built: ${LAST:-<none>} | Upstream: $TAG | Force: ${FORCE:-false}"
+          if [ "$FORCE" = "true" ]; then
+            echo "new_release=true" >> $GITHUB_OUTPUT
+            echo "Force build requested — building $TAG regardless of last built version."
+          elif [ "$TAG" = "$LAST" ]; then
             echo "new_release=false" >> $GITHUB_OUTPUT
             echo "Already built $TAG — nothing to do."
           else
@@ -58,11 +68,16 @@ jobs:
     # Keep windows-latest — build.ps1 explicitly auto-detects VS version ("pick whatever VS the host has")
     runs-on: windows-latest
     permissions:
-      contents: read
+      contents: write  # required to publish the GitHub release (and tag)
       actions: write   # required to update LAST_BUILT_VERSION variable on success
 
     steps:
+      # Pin to master so we build the freshly-synced upstream code, not the
+      # (stale) SHA that triggered the scheduled run.
       - uses: actions/checkout@v5  # v5 uses Node.js 24; v4 triggers Node.js 20 deprecation warning
+        with:
+          ref: master
+          fetch-depth: 0  # full history so the release tag resolves cleanly
 
       - uses: pnpm/action-setup@v4
         with:
@@ -84,6 +99,34 @@ jobs:
           path: WandEnhancer/bin/Release/WandEnhancer.exe
           if-no-files-found: error
           retention-days: 90
+
+      # Pull release notes from the changelog if a matching section exists;
+      # otherwise fall back to a generic note so the release always publishes.
+      - name: Generate release notes
+        if: success()
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          try {
+            ./scripts/get-changelog-section.ps1 -Version $env:VERSION -OutputPath release-notes.md
+          } catch {
+            Write-Host "Changelog lookup failed ($($_.Exception.Message)); using fallback notes."
+          }
+          if (-not (Test-Path release-notes.md) -or -not (Get-Content release-notes.md -Raw).Trim()) {
+            "Automated build of upstream Wand-Enhancer release **$env:VERSION**." | Out-File release-notes.md -Encoding utf8
+          }
+
+      - name: Publish GitHub release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.version }}
+          name: ${{ needs.check.outputs.version }}
+          target_commitish: master  # tag the synced commit, not the stale trigger SHA
+          body_path: release-notes.md
+          files: WandEnhancer/bin/Release/WandEnhancer.exe
+          fail_on_unmatched_files: true
 
       # Only runs if all prior steps succeeded. Creates/updates the LAST_BUILT_VERSION
       # repo variable so the next scheduled check skips the build correctly.
