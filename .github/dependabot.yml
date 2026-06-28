@@ -1,0 +1,37 @@
+version: 2
+updates:
+  # GitHub Actions used in workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+
+  # .NET (NuGet) projects
+  - package-ecosystem: "nuget"
+    directory: "/WandEnhancer"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+  - package-ecosystem: "nuget"
+    directory: "/AsarSharp"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+
+  # Web panel (pnpm — read via the npm ecosystem)
+  - package-ecosystem: "npm"
+    directory: "/web-panel"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+  - package-ecosystem: "npm"
+    directory: "/web-panel/bridge"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
