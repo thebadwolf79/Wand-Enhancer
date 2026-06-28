@@ -1,23 +1,15 @@
-# Template: add this file to your Wand-Enhancer fork at
-#   .github/workflows/auto-sync-build.yml
-#
-# What it does:
-#   Every 6 hours, checks if k1tbyte/Wand-Enhancer has a release tag that
-#   isn't on your fork yet. If so, syncs master and builds the exe automatically.
-#   The artifact is named WandEnhancer-<version> and kept for 90 days.
-
 name: Auto sync and build
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 12 * * *'  # daily at noon UTC; releases are infrequent, 6h was excessive
   workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write   # required for merge-upstream API call
     outputs:
       new_release: ${{ steps.compare.outputs.new_release }}
       version: ${{ steps.compare.outputs.version }}
@@ -30,21 +22,24 @@ jobs:
         run: |
           TAG=$(gh api repos/k1tbyte/Wand-Enhancer/releases/latest --jq '.tag_name')
           echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "Upstream tag: $TAG"
+          echo "Upstream: $TAG"
 
-      - name: Check if fork already has this tag
+      # Uses the LAST_BUILT_VERSION repo variable (set by the build job on success).
+      # Reading via vars context requires no permissions; no gh api call needed.
+      # On first run the variable is empty, so any upstream release will trigger a build.
+      - name: Compare against last built version
         id: compare
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.upstream.outputs.tag }}"
+          LAST="${{ vars.LAST_BUILT_VERSION }}"
           echo "version=$TAG" >> $GITHUB_OUTPUT
-          if gh api "repos/${{ github.repository }}/git/refs/tags/$TAG" > /dev/null 2>&1; then
+          echo "Last built: ${LAST:-<none>} | Upstream: $TAG"
+          if [ "$TAG" = "$LAST" ]; then
             echo "new_release=false" >> $GITHUB_OUTPUT
-            echo "Already at $TAG — nothing to do."
+            echo "Already built $TAG — nothing to do."
           else
             echo "new_release=true" >> $GITHUB_OUTPUT
-            echo "New release $TAG not on fork yet — syncing."
+            echo "New release $TAG detected."
           fi
 
       - name: Sync fork master with upstream
@@ -52,25 +47,28 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          echo "Syncing fork master with upstream..."
           gh api "repos/${{ github.repository }}/merge-upstream" \
-            -X POST \
-            -f branch=master
+            -X POST -f branch=master
+          echo "Sync complete."
 
   build:
     needs: check
     if: needs.check.outputs.new_release == 'true'
+    # Keep windows-latest — build.ps1 explicitly auto-detects VS version ("pick whatever VS the host has")
     runs-on: windows-latest
     permissions:
       contents: read
+      actions: write   # required to update LAST_BUILT_VERSION variable on success
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5  # v5 uses Node.js 24; v4 triggers Node.js 20 deprecation warning
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: 10  # must match the version used to generate web-panel/pnpm-lock.yaml
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5  # v5 uses Node.js 24
         with:
           node-version: 22
           cache: pnpm
@@ -80,10 +78,27 @@ jobs:
         shell: pwsh
         run: ./build.ps1 -Configuration Release
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: WandEnhancer-${{ needs.check.outputs.version }}
           path: WandEnhancer/bin/Release/WandEnhancer.exe
           if-no-files-found: error
           retention-days: 90
+
+      # Only runs if all prior steps succeeded. Creates/updates the LAST_BUILT_VERSION
+      # repo variable so the next scheduled check skips the build correctly.
+      # PATCH fails with 404 if variable doesn't exist yet; fall back to POST.
+      - name: Mark version as built
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $VERSION = "${{ needs.check.outputs.version }}"
+          $null = gh api "repos/${{ github.repository }}/actions/variables/LAST_BUILT_VERSION" `
+            -X PATCH -f "value=$VERSION" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            gh api "repos/${{ github.repository }}/actions/variables" `
+              -X POST -f "name=LAST_BUILT_VERSION" -f "value=$VERSION"
+          }
+          Write-Host "Marked $VERSION as built."
